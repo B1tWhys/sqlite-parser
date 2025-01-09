@@ -328,7 +328,7 @@ class BTreePage_IndexLeaf(Page):
         if idx >= len(self.cells) or self.cells[idx].record.values[:len(key)] != key:
             return None
         cell_row_id = self.cells[idx].record.values[-1]
-        return get_user_info_by_row_id(self.database, cell_row_id)
+        return get_user_info_by_id(self.database, cell_row_id)
 
 
 class Database:
@@ -351,7 +351,7 @@ class Database:
         return Page.build_page(self, self.file)
 
 
-def get_user_info_by_row_id(db, row_id, quiet=True) -> List[any] | None:
+def get_user_info_by_id(db, row_id, quiet=True) -> List[any] | None:
     users_table_page_num = db.get_root_page_num("users")
     users_table_root = db.get_page(users_table_page_num)
     record = users_table_root.get_record(row_id)
@@ -384,7 +384,7 @@ def get_user_info_by_email(db, email):
 def main():
     with open(FILE_NAME, "rb") as file:
         db = Database(file)
-        get_user_info_by_row_id(db, TARGET_ROW_ID)
+        get_user_info_by_id(db, TARGET_ROW_ID)
         get_user_info_by_email(db, TARGET_EMAIL_ID)
 
 
