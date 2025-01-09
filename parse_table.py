@@ -7,7 +7,9 @@ from enum import Enum
 from io import BytesIO
 from typing import Optional, List, BinaryIO
 
-import pytest
+FILE_NAME = "./example.db"
+TARGET_ROW_ID = 450
+TARGET_EMAIL_ID = "user_450@example.com"
 
 
 def read_varint(file):
@@ -362,15 +364,15 @@ def get_user_info_by_row_id(db, row_id, quiet=True) -> List[any] | None:
 
 
 def get_user_info_by_email(db, email):
-    col_name_to_index_name = {
-        "username": "sqlite_autoindex_users_1",
-        "email": "sqlite_autoindex_users_2"
-    }
+    # There doesn't seem to be a way to resolve a column into an index name, without
+    # parsing the sql syntax used to construct the table, and figuring out what the Nth
+    # column that got created with an explicit or implicit (i.e. UNIQUE) index created was.
+    # Then you can use that to figure out the name of the index. It's really silly, so instead
+    # I just hard coded that the index for the email column is called sqlite_autoindex_users_2.
+    # I think this is a slight design flaw with sqlite, they should have a column for indexes
+    # to indicate which column(s) they pertain to.
     page_num = db.get_root_page_num("sqlite_autoindex_users_2", "index")
     root_page = db.get_page(page_num)
-    cell: IndexInteriorCell = root_page.cells[0]
-    # print(cell.record.values)
-    # print(cell.child_page_ptr)
     record = root_page.get_record([email])
     if record is None:
         print(f"Didn't find email: {email}")
@@ -380,31 +382,32 @@ def get_user_info_by_email(db, email):
 
 
 def main():
-    fname = "./example.db"
-    TARGET_ROW_ID = 450  # "450|user_450|user_450@example.com|password_450|2025-01-02 05:44:00"
-    # TARGET_EMAIL_ID = "user_450@example.com"
-    TARGET_EMAIL_ID = "asdf"
-    with open(fname, "rb") as file:
+    with open(FILE_NAME, "rb") as file:
         db = Database(file)
-        # get_user_info_by_row_id(db, TARGET_ROW_ID)
+        get_user_info_by_row_id(db, TARGET_ROW_ID)
         get_user_info_by_email(db, TARGET_EMAIL_ID)
 
 
-@pytest.mark.parametrize(
-    "data, expected_val, expected_delta",
-    [
-        (b"\x00", 0, 1),
-        (b"\x81\x01", 0b10000001, 2),
-        (b"\x81\x81\x01", 0b100000010000001, 3),
-        (b"\x81" * 8 + b"\x01", 0x0204081020408101, 9),
-    ],
-)
-def test_read_varint(data, expected_val, expected_delta):
-    buffer = BytesIO(data)
-    buffer.seek(0)
-    actual_val = read_varint(buffer)
-    assert bin(actual_val) == bin(expected_val)
+try:
+    import pytest
 
+
+    @pytest.mark.parametrize(
+        "data, expected_val, expected_delta",
+        [
+            (b"\x00", 0, 1),
+            (b"\x81\x01", 0b10000001, 2),
+            (b"\x81\x81\x01", 0b100000010000001, 3),
+            (b"\x81" * 8 + b"\x01", 0x0204081020408101, 9),
+        ],
+    )
+    def test_read_varint(data, expected_val, expected_delta):
+        buffer = BytesIO(data)
+        buffer.seek(0)
+        actual_val = read_varint(buffer)
+        assert bin(actual_val) == bin(expected_val)
+except ImportError:
+    pass
 
 if __name__ == "__main__":
     main()
