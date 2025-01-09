@@ -87,7 +87,7 @@ class BTreePageType(Enum):
     TABLE_INTERIOR = 0x05
     TABLE_LEAF = 0x0D
     INDEX_INTERIOR = 0x02
-    INDEX_LEAF = 0x10
+    INDEX_LEAF = 0x0A
 
 
 class Cell(ABC):
@@ -112,6 +112,26 @@ class TableInteriorCell(Cell):
     def __init__(self, file: BinaryIO):
         self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
         self.key = read_varint(file)
+
+
+class IndexInteriorCell(Cell):
+    child_page_ptr: int
+    payload_size: int
+    record: "Record"
+
+    def __init__(self, file: BinaryIO):
+        self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
+        self.payload_size = read_varint(file)
+        self.record = Record(file)
+
+
+class IndexLeafCell(Cell):
+    payload_size: int
+    record: "Record"
+
+    def __init__(self, file: BinaryIO):
+        self.payload_size = read_varint(file)
+        self.record = Record(file)
 
 
 class Record:
@@ -208,11 +228,15 @@ class Page(ABC):
                 return BTreePage_TableLeaf(file)
             case BTreePageType.TABLE_INTERIOR:
                 return BTreePage_TableInterior(file, database)
+            case BTreePageType.INDEX_INTERIOR:
+                return BTreePage_IndexInterior(file, database)
+            case BTreePageType.INDEX_LEAF:
+                return BTreePage_IndexLeaf(file, database)
             case _:
                 raise ValueError(f"Unsupported page type: {page_type}")
 
     @abstractmethod
-    def get_record(self, key: int) -> Optional[Record]:
+    def get_record(self, key: any) -> Optional[Record]:
         pass
 
 
@@ -261,16 +285,60 @@ class BTreePage_TableInterior(Page):
         return child_page.get_record(row_id)
 
 
+@dataclass
+class BTreePage_IndexInterior(Page):
+    database: "Database"
+    cells: List[IndexInteriorCell]
+
+    def __init__(self, file: BinaryIO, db: "Database"):
+        super().__init__(file)
+
+        self.database = db
+        num_cells = self.pageHeader.numCellsInPage
+        cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
+        for ptr in cell_ptrs:
+            file.seek(self.offset + ptr)
+            self.cells.append(IndexInteriorCell(file))
+
+    def get_record(self, key: List[any]) -> Optional[Record]:
+        idx = bisect_left(self.cells, key, key=lambda cell: cell.record.values)
+        if idx < len(self.cells) and self.cells[idx].record.values >= key:
+            child_page = self.database.get_page(self.cells[idx].child_page_ptr)
+        else:
+            child_page = self.database.get_page(self.pageHeader.rightPtr)
+        return child_page.get_record(key)
+
+
+class BTreePage_IndexLeaf(Page):
+    cells: List[IndexLeafCell]
+
+    def __init__(self, file: BinaryIO, db: "Database"):
+        super().__init__(file)
+        self.database = db
+        num_cells = self.pageHeader.numCellsInPage
+        cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
+        for ptr in cell_ptrs:
+            file.seek(self.offset + ptr)
+            self.cells.append(IndexLeafCell(file))
+
+    def get_record(self, key: List[any]) -> Optional[Record]:
+        idx = bisect_left(self.cells, key, key=lambda cell: cell.record.values)
+        if idx >= len(self.cells) or self.cells[idx].record.values[:len(key)] != key:
+            return None
+        cell_row_id = self.cells[idx].record.values[-1]
+        return get_user_info_by_row_id(self.database, cell_row_id)
+
+
 class Database:
     def __init__(self, file: BinaryIO):
         self.file = file
         self.header = FileHeader(file)
         self.schema_page = self.get_page(1)
 
-    def get_root_page_num(self, table_name):
+    def get_root_page_num(self, target_object_name, target_object_type="table"):
         for record in self.schema_page.records:
             object_type, object_name, object_table, object_page, schema = record.values
-            if object_type == 'table' and object_name == table_name:
+            if object_name == target_object_name and object_type == target_object_type:
                 return object_page
 
     def get_page(self, page_number) -> Page:
@@ -281,18 +349,45 @@ class Database:
         return Page.build_page(self, self.file)
 
 
+def get_user_info_by_row_id(db, row_id, quiet=True) -> List[any] | None:
+    users_table_page_num = db.get_root_page_num("users")
+    users_table_root = db.get_page(users_table_page_num)
+    record = users_table_root.get_record(row_id)
+    if record is None:
+        if not quiet: print("Didn't find the record!")
+        return None
+    else:
+        if not quiet: print(record.values)
+        return record
+
+
+def get_user_info_by_email(db, email):
+    col_name_to_index_name = {
+        "username": "sqlite_autoindex_users_1",
+        "email": "sqlite_autoindex_users_2"
+    }
+    page_num = db.get_root_page_num("sqlite_autoindex_users_2", "index")
+    root_page = db.get_page(page_num)
+    cell: IndexInteriorCell = root_page.cells[0]
+    # print(cell.record.values)
+    # print(cell.child_page_ptr)
+    record = root_page.get_record([email])
+    if record is None:
+        print(f"Didn't find email: {email}")
+    else:
+        print(record.values)
+        return record
+
+
 def main():
     fname = "./example.db"
-    TARGET_ROW_ID = 413  # "450|user_450|user_450@example.com|password_450|2025-01-02 05:44:00"
+    TARGET_ROW_ID = 450  # "450|user_450|user_450@example.com|password_450|2025-01-02 05:44:00"
+    # TARGET_EMAIL_ID = "user_450@example.com"
+    TARGET_EMAIL_ID = "asdf"
     with open(fname, "rb") as file:
         db = Database(file)
-        users_table_page_num = db.get_root_page_num("users")
-        users_table_root = db.get_page(users_table_page_num)
-        record = users_table_root.get_record(TARGET_ROW_ID)
-        if record is None:
-            print("Didn't find the record!")
-        else:
-            print(record.values)
+        # get_user_info_by_row_id(db, TARGET_ROW_ID)
+        get_user_info_by_email(db, TARGET_EMAIL_ID)
 
 
 @pytest.mark.parametrize(
