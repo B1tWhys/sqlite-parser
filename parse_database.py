@@ -1,4 +1,3 @@
-import json
 import os
 import struct
 from abc import ABC, abstractmethod
@@ -364,6 +363,7 @@ def get_user_info_by_id(db, row_id) -> Record | None:
     record = users_table_root.get_record(row_id)
     return record
 
+
 def get_user_info_by_email(db, email):
     # There doesn't seem to be a way to resolve a column into an index name, without
     # parsing the sql syntax used to construct the table, and figuring out what the Nth
@@ -376,11 +376,6 @@ def get_user_info_by_email(db, email):
     root_page = db.get_page(page_num)
     record = root_page.get_record([email])
     return record
-    # if record is None:
-    #     print(f"Didn't find email: {email}")
-    # else:
-    #     print(record.values)
-    #     return record
 
 
 def main():
