@@ -3,6 +3,8 @@
 Just playing around with sqlite. I wrote a parser from scratch that traverses
 the table/index btrees in a sqlite database file to find a specific record.
 
+A detailed writeup of this project is available on my blog. (Check it out!)[https://skylerarnold.com/blog/sqlite-the-hard-way]
+
 ## Usage
 
 Clone the repo and run `python3 parse_table.py`. It'll run the equivalent of these 2 sql queries against the included `example.db` file:
