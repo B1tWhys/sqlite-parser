@@ -1,3 +1,4 @@
+import json
 import os
 import struct
 from abc import ABC, abstractmethod
@@ -85,59 +86,8 @@ class FileHeader:
         self.vacuum_mode = vacuum_mode != 0
 
 
-class BTreePageType(Enum):
-    TABLE_INTERIOR = 0x05
-    TABLE_LEAF = 0x0D
-    INDEX_INTERIOR = 0x02
-    INDEX_LEAF = 0x0A
-
-
-class Cell(ABC):
-    pass
-
-
-class TableLeafCell(Cell):
-    row_id: int
-    payload_size: int
-    record: "Record"
-
-    def __init__(self, file):
-        self.payload_size = read_varint(file)
-        self.row_id = read_varint(file)
-        self.record = Record(file)
-
-
-class TableInteriorCell(Cell):
-    child_page_ptr: int
-    key: int
-
-    def __init__(self, file: BinaryIO):
-        self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
-        self.key = read_varint(file)
-
-
-class IndexInteriorCell(Cell):
-    child_page_ptr: int
-    payload_size: int
-    record: "Record"
-
-    def __init__(self, file: BinaryIO):
-        self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
-        self.payload_size = read_varint(file)
-        self.record = Record(file)
-
-
-class IndexLeafCell(Cell):
-    payload_size: int
-    record: "Record"
-
-    def __init__(self, file: BinaryIO):
-        self.payload_size = read_varint(file)
-        self.record = Record(file)
-
-
 class Record:
-    def __init__(self, file: BinaryIO):
+    def __init__(self, file: BinaryIO, encoding: str):
         self.values = []
         record_start_offset = file.tell()
         header_size = read_varint(file)
@@ -175,7 +125,7 @@ class Record:
                 case x if x >= 13 and x % 2 == 1:  # text
                     size = (x - 13) // 2
                     val = file.read(size)
-                    val = val.decode('utf-8')  # FIXME: use the text encoding from the file header
+                    val = val.decode(encoding)
                 case _:
                     raise ValueError(
                         f"Unexpected dtype: {dtype} at record starting at offset: 0x{record_start_offset:08x}, field: {i} (of {len(dtypes)} fields) at offset: {field_offset:08x}")
@@ -183,28 +133,84 @@ class Record:
             self.values.append(val)
 
 
-class PageHeader:
-    typeId: BTreePageType
-    firstFreeBlockOffset: int
-    numCellsInPage: int
-    cellContentAreaOffset: int
-    fragmentedFreeBytes: int
-    rightPtr: Optional[int]
-    headerSize: int
+@dataclass
+class Cell(ABC):
+    pass
+
+
+@dataclass
+class TableLeafCell(Cell):
+    row_id: int
+    payload_size: int
+    record: "Record"
+
+    def __init__(self, file, encoding):
+        self.payload_size = read_varint(file)
+        self.row_id = read_varint(file)
+        self.record = Record(file, encoding)
+
+
+class TableInteriorCell(Cell):
+    child_page_ptr: int
+    key: int
 
     def __init__(self, file: BinaryIO):
-        self.typeId = BTreePageType(file.read(1)[0])
-        (self.firstFreeBlockOffset,
-         self.numCellsInPage,
-         self.cellContentAreaOffset,
-         self.fragmentedFreeBytes) = struct.unpack(">3HB", file.read(7))
-        if self.typeId in (BTreePageType.TABLE_INTERIOR, BTreePageType.INDEX_INTERIOR):
-            self.rightPtr = struct.unpack(">I", file.read(4))[0]
-            self.headerSize = 12
+        self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
+        self.key = read_varint(file)
+
+
+class IndexInteriorCell(Cell):
+    child_page_ptr: int
+    payload_size: int
+    record: "Record"
+
+    def __init__(self, file: BinaryIO, encoding: str):
+        self.child_page_ptr = struct.unpack(">I", file.read(4))[0]
+        self.payload_size = read_varint(file)
+        self.record = Record(file, encoding)
+
+
+class IndexLeafCell(Cell):
+    payload_size: int
+    record: "Record"
+
+    def __init__(self, file: BinaryIO, encoding: str):
+        self.payload_size = read_varint(file)
+        self.record = Record(file, encoding)
+
+
+class BTreePageType(Enum):
+    TABLE_INTERIOR = 0x05
+    TABLE_LEAF = 0x0D
+    INDEX_INTERIOR = 0x02
+    INDEX_LEAF = 0x0A
+
+
+@dataclass
+class PageHeader:
+    type_id: BTreePageType
+    first_free_block_offset: int
+    num_cells_in_page: int
+    cell_content_area_offset: int
+    fragmented_free_bytes: int
+    right_ptr: Optional[int]
+    header_size: int
+
+    def __init__(self, file: BinaryIO):
+        self.type_id = BTreePageType(file.read(1)[0])
+        (self.first_free_block_offset,
+         self.num_cells_in_page,
+         self.cell_content_area_offset,
+         self.fragmented_free_bytes) = struct.unpack(">3HB", file.read(7))
+        if self.type_id in (BTreePageType.TABLE_INTERIOR, BTreePageType.INDEX_INTERIOR):
+            self.right_ptr = struct.unpack(">I", file.read(4))[0]
+            self.header_size = 12
         else:
-            self.headerSize = 8
+            self.right_ptr = None
+            self.header_size = 8
 
 
+@dataclass
 class Page(ABC):
     offset: int
     pageHeader: PageHeader
@@ -212,48 +218,49 @@ class Page(ABC):
 
     def __init__(self, file: BinaryIO):
         self.offset = file.tell()
+        # If this is the first page of the database, the file-level header shifts everything by 100 bytes
         if self.offset <= 100:
             self.offset = 0
         self.cells = []
         self.pageHeader = PageHeader(file)
 
-    @property
-    def records(self):
-        return [cell.record for cell in sorted(self.cells, key=lambda cell: cell.row_id)]
-
     @staticmethod
-    def build_page(database: "Database", file: BinaryIO):
+    def build_page(database: "Database", file: BinaryIO) -> "Page":
         page_type = BTreePageType(file.read(1)[0])
         file.seek(-1, os.SEEK_CUR)
         match page_type:
             case BTreePageType.TABLE_LEAF:
-                return BTreePage_TableLeaf(file)
+                return TableLeafPage(file, database)
             case BTreePageType.TABLE_INTERIOR:
-                return BTreePage_TableInterior(file, database)
+                return TableInteriorPage(file, database)
             case BTreePageType.INDEX_INTERIOR:
-                return BTreePage_IndexInterior(file, database)
+                return IndexInteriorPage(file, database)
             case BTreePageType.INDEX_LEAF:
-                return BTreePage_IndexLeaf(file, database)
+                return IndexLeafPage(file, database)
             case _:
                 raise ValueError(f"Unsupported page type: {page_type}")
 
+    @property
+    def records(self):
+        return [cell.record for cell in sorted(self.cells, key=lambda cell: cell.row_id)]
+
     @abstractmethod
-    def get_record(self, key: any) -> Optional[Record]:
+    def get_record(self, key: any) -> Optional["Record"]:
         pass
 
 
 @dataclass
-class BTreePage_TableLeaf(Page):
+class TableLeafPage(Page):
     cells: List[TableLeafCell]
 
-    def __init__(self, file: BinaryIO):
+    def __init__(self, file: BinaryIO, db: "Database"):
         super().__init__(file)
 
-        num_cells = self.pageHeader.numCellsInPage
+        num_cells = self.pageHeader.num_cells_in_page
         cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
         for ptr in cell_ptrs:
             file.seek(self.offset + ptr)
-            self.cells.append(TableLeafCell(file))
+            self.cells.append(TableLeafCell(file, db.header.text_encoding))
 
     def get_record(self, row_id: int) -> Optional[Record]:
         idx = bisect_left(self.cells, row_id, key=lambda cell: cell.row_id)
@@ -264,7 +271,7 @@ class BTreePage_TableLeaf(Page):
 
 
 @dataclass
-class BTreePage_TableInterior(Page):
+class TableInteriorPage(Page):
     database: "Database"
     cells: List[TableInteriorCell]
 
@@ -272,7 +279,7 @@ class BTreePage_TableInterior(Page):
         super().__init__(file)
 
         self.database = database
-        num_cells = self.pageHeader.numCellsInPage
+        num_cells = self.pageHeader.num_cells_in_page
         cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
         for ptr in cell_ptrs:
             file.seek(self.offset + ptr)
@@ -283,12 +290,12 @@ class BTreePage_TableInterior(Page):
         if idx < len(self.cells) and self.cells[idx].key >= row_id:
             child_page = self.database.get_page(self.cells[idx].child_page_ptr)
         else:
-            child_page = self.database.get_page(self.pageHeader.rightPtr)
+            child_page = self.database.get_page(self.pageHeader.right_ptr)
         return child_page.get_record(row_id)
 
 
 @dataclass
-class BTreePage_IndexInterior(Page):
+class IndexInteriorPage(Page):
     database: "Database"
     cells: List[IndexInteriorCell]
 
@@ -296,32 +303,32 @@ class BTreePage_IndexInterior(Page):
         super().__init__(file)
 
         self.database = db
-        num_cells = self.pageHeader.numCellsInPage
+        num_cells = self.pageHeader.num_cells_in_page
         cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
         for ptr in cell_ptrs:
             file.seek(self.offset + ptr)
-            self.cells.append(IndexInteriorCell(file))
+            self.cells.append(IndexInteriorCell(file, db.header.text_encoding))
 
     def get_record(self, key: List[any]) -> Optional[Record]:
         idx = bisect_left(self.cells, key, key=lambda cell: cell.record.values)
         if idx < len(self.cells) and self.cells[idx].record.values >= key:
             child_page = self.database.get_page(self.cells[idx].child_page_ptr)
         else:
-            child_page = self.database.get_page(self.pageHeader.rightPtr)
+            child_page = self.database.get_page(self.pageHeader.right_ptr)
         return child_page.get_record(key)
 
 
-class BTreePage_IndexLeaf(Page):
+class IndexLeafPage(Page):
     cells: List[IndexLeafCell]
 
     def __init__(self, file: BinaryIO, db: "Database"):
         super().__init__(file)
         self.database = db
-        num_cells = self.pageHeader.numCellsInPage
+        num_cells = self.pageHeader.num_cells_in_page
         cell_ptrs = struct.unpack(f'>{num_cells}H', file.read(num_cells * 2))
         for ptr in cell_ptrs:
             file.seek(self.offset + ptr)
-            self.cells.append(IndexLeafCell(file))
+            self.cells.append(IndexLeafCell(file, db.header.text_encoding))
 
     def get_record(self, key: List[any]) -> Optional[Record]:
         idx = bisect_left(self.cells, key, key=lambda cell: cell.record.values)
@@ -351,17 +358,11 @@ class Database:
         return Page.build_page(self, self.file)
 
 
-def get_user_info_by_id(db, row_id, quiet=True) -> List[any] | None:
+def get_user_info_by_id(db, row_id) -> Record | None:
     users_table_page_num = db.get_root_page_num("users")
     users_table_root = db.get_page(users_table_page_num)
     record = users_table_root.get_record(row_id)
-    if record is None:
-        if not quiet: print("Didn't find the record!")
-        return None
-    else:
-        if not quiet: print(record.values)
-        return record
-
+    return record
 
 def get_user_info_by_email(db, email):
     # There doesn't seem to be a way to resolve a column into an index name, without
@@ -374,18 +375,27 @@ def get_user_info_by_email(db, email):
     page_num = db.get_root_page_num("sqlite_autoindex_users_2", "index")
     root_page = db.get_page(page_num)
     record = root_page.get_record([email])
-    if record is None:
-        print(f"Didn't find email: {email}")
-    else:
-        print(record.values)
-        return record
+    return record
+    # if record is None:
+    #     print(f"Didn't find email: {email}")
+    # else:
+    #     print(record.values)
+    #     return record
 
 
 def main():
     with open(FILE_NAME, "rb") as file:
         db = Database(file)
-        get_user_info_by_id(db, TARGET_ROW_ID)
-        get_user_info_by_email(db, TARGET_EMAIL_ID)
+        info_by_id = get_user_info_by_id(db, TARGET_ROW_ID)
+        if info_by_id:
+            print(f"Found user info by id: {info_by_id.values}")
+        else:
+            print("Couldn't find user by id")
+        info_by_email = get_user_info_by_email(db, TARGET_EMAIL_ID)
+        if info_by_email:
+            print(f"Found user info by email: {info_by_email.values}")
+        else:
+            print(f"Couldn't find user info by email")
 
 
 try:
